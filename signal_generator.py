@@ -8,13 +8,12 @@ from datetime import datetime, timedelta
 import logging
 import pickle
 
-from feature_engineering import build_features, get_feature_columns, zscore
+from feature_engineering import build_features, get_feature_columns, zscore, ALL_SECTOR_ETFS
 from data_pipeline import get_sp500_universe
+from config import TOP_N
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-MIN_PROB        = 0.52
 LOOKBACK_DAYS   = 504   # 2 trading years: covers 52-week rolling windows + sector history
 UNIVERSE_CACHE  = Path("data/clean/universe.json")
 UNIVERSE_TTL    = 7     # days before re-scraping Wikipedia
@@ -185,12 +184,11 @@ def _fetch_etf_raw(etfs: list[str], start: str, end: str) -> pd.DataFrame:
 def add_returns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     close = df["Close"]
-    df["ret_1d"]     = close.pct_change(1)
-    df["ret_2d"]     = close.pct_change(2)
-    df["ret_5d"]     = close.pct_change(5)
-    df["ret_10d"]    = close.pct_change(10)
-    df["ret_20d"]    = close.pct_change(20)
-    df["fwd_ret_5d"] = np.nan   # unknown at signal time
+    df["ret_1d"]  = close.pct_change(1)
+    df["ret_2d"]  = close.pct_change(2)
+    df["ret_5d"]  = close.pct_change(5)
+    df["ret_10d"] = close.pct_change(10)
+    df["ret_20d"] = close.pct_change(20)
     return df
 
 
@@ -210,7 +208,7 @@ def compute_sector_zscore(df: pd.DataFrame, sector_etf: str,
         return 0.0
 
 
-def generate_signals(min_prob: float = MIN_PROB) -> pd.DataFrame:
+def generate_signals(top_n: int = TOP_N) -> pd.DataFrame:
     model, feature_cols = load_model()
     universe = _get_universe()
 
@@ -228,7 +226,8 @@ def generate_signals(min_prob: float = MIN_PROB) -> pd.DataFrame:
     current_vix = fetch_current_vix()
     vix_low     = float(current_vix < 15)
     vix_normal  = float(15 <= current_vix < 20)
-    vix_high    = float(current_vix >= 20)
+    vix_high    = float(20 <= current_vix < 30)
+    vix_fear    = float(current_vix >= 30)
 
     all_etfs    = list(set(universe.values()))
     sector_rets = fetch_sector_etf_returns(all_etfs, start_str, end_str)
@@ -249,7 +248,7 @@ def generate_signals(min_prob: float = MIN_PROB) -> pd.DataFrame:
 
     # these are computed globally (not per-ticker) and injected after the loop
     rank_cols   = {c for c in feature_cols if "_xs_rank" in c or "_sec_rank" in c}
-    global_ctx  = {"vix", "vix_low", "vix_normal", "vix_high",
+    global_ctx  = {"vix", "vix_low", "vix_normal", "vix_high", "vix_fear",
                    "sector_rel_zscore", "xs_disp_5d", "xs_disp_20d"}
     base_cols   = [c for c in feature_cols if c not in rank_cols and c not in global_ctx]
 
@@ -270,6 +269,12 @@ def generate_signals(min_prob: float = MIN_PROB) -> pd.DataFrame:
             row["vix_low"]           = vix_low
             row["vix_normal"]        = vix_normal
             row["vix_high"]          = vix_high
+            row["vix_fear"]          = vix_fear
+
+            # Sector one-hot: same encoding used during training
+            ticker_sector = universe.get(ticker, "SPY")
+            for etf in ALL_SECTOR_ETFS:
+                row[f"sector_{etf}"] = 1.0 if etf == ticker_sector else 0.0
             row["sector_rel_zscore"] = compute_sector_zscore(
                 df, universe.get(ticker, "SPY"), sector_rets)
             row["xs_disp_5d"]        = xs_disp_5d
@@ -328,24 +333,20 @@ def generate_signals(min_prob: float = MIN_PROB) -> pd.DataFrame:
     X = features_df[feature_cols]
     features_df["prob_up"] = model.predict_proba(X)[:, 1]
 
-    # long: high confidence of outperformance; short: high confidence of underperformance
-    long_mask  = features_df["prob_up"] >= min_prob
-    short_mask = features_df["prob_up"] <= (1.0 - min_prob)
-
-    longs  = features_df[long_mask].copy()
-    longs["side"] = "long"
-    shorts = features_df[short_mask].copy()
+    # Top-N selection: rank all stocks by confidence, take best N each direction.
+    longs  = features_df.nlargest(top_n,  "prob_up").copy()
+    shorts = features_df.nsmallest(top_n, "prob_up").copy()
+    longs["side"]  = "long"
     shorts["side"] = "short"
 
     signals = pd.concat([longs, shorts], ignore_index=True)
-    # sort: longs by prob_up desc, shorts by prob_up asc (most confident first)
     signals["_sort"] = signals.apply(
         lambda r: r["prob_up"] if r["side"] == "long" else 1.0 - r["prob_up"], axis=1
     )
     signals = signals.sort_values("_sort", ascending=False).drop(columns="_sort")
 
     regime = "CALM" if current_vix < 15 else "NORMAL" if current_vix < 20 else "ELEVATED" if current_vix < 30 else "FEAR"
-    log.info(f"{long_mask.sum()} long  ·  {short_mask.sum()} short  "
+    log.info(f"top-{top_n} long  ·  top-{top_n} short  "
              f"from {len(features_df)} stocks  |  VIX={current_vix:.1f} ({regime})")
 
     out_cols = [

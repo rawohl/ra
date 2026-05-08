@@ -27,6 +27,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from feature_engineering import get_feature_columns
+from config import TOP_N
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -36,7 +37,6 @@ MODEL_DIR.mkdir(exist_ok=True)
 
 TRAIN_YEARS = 2
 TEST_MONTHS = 3
-MIN_PROB    = 0.52
 LGBM_PARAMS = {
     "objective":        "binary",
     "metric":           "auc",
@@ -122,8 +122,66 @@ def get_walk_forward_splits(df, train_years=TRAIN_YEARS, test_months=TEST_MONTHS
     return splits
 
 
-def train_fold(X_train, y_train, X_val, y_val):
-    model = lgb.LGBMClassifier(**LGBM_PARAMS)
+def tune_hyperparams(X_tr, y_tr, X_val, y_val, n_trials: int = 50) -> dict:
+    """
+    Optuna TPE search over LightGBM hyperparameters.
+    Tuned on the first fold's training split so the result is time-aware.
+    Returns a full params dict ready to pass to LGBMClassifier.
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    def objective(trial):
+        params = {
+            "objective":         "binary",
+            "metric":            "auc",
+            "verbose":           -1,
+            "n_jobs":            -1,
+            "n_estimators":      1000,
+            "early_stopping_rounds": 50,
+            "learning_rate":     trial.suggest_float("learning_rate",     0.005, 0.15,  log=True),
+            "num_leaves":        trial.suggest_int(  "num_leaves",        16,    255),
+            "min_child_samples": trial.suggest_int(  "min_child_samples", 20,    300),
+            "feature_fraction":  trial.suggest_float("feature_fraction",  0.4,   1.0),
+            "bagging_fraction":  trial.suggest_float("bagging_fraction",  0.4,   1.0),
+            "bagging_freq":      trial.suggest_int(  "bagging_freq",      1,     10),
+            "reg_alpha":         trial.suggest_float("reg_alpha",         1e-3,  10.0, log=True),
+            "reg_lambda":        trial.suggest_float("reg_lambda",        1e-3,  10.0, log=True),
+            "min_split_gain":    trial.suggest_float("min_split_gain",    0.0,   1.0),
+            "subsample_for_bin": trial.suggest_int(  "subsample_for_bin", 50000, 300000),
+        }
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_val, y_val)],
+            callbacks=[lgb.early_stopping(50, verbose=False),
+                       lgb.log_evaluation(period=-1)],
+        )
+        return roc_auc_score(y_val, model.predict_proba(X_val)[:, 1])
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=10),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    log.info(f"Optuna best val AUC: {study.best_value:.4f}")
+    log.info(f"Best params: {study.best_params}")
+
+    return {
+        "objective":         "binary",
+        "metric":            "auc",
+        "verbose":           -1,
+        "n_jobs":            -1,
+        "n_estimators":      1000,
+        "early_stopping_rounds": 50,
+        **study.best_params,
+    }
+
+
+def train_fold(X_train, y_train, X_val, y_val, params: dict = None):
+    model = lgb.LGBMClassifier(**(params or LGBM_PARAMS))
     model.fit(
         X_train, y_train,
         eval_set=[(X_val, y_val)],
@@ -135,32 +193,50 @@ def train_fold(X_train, y_train, X_val, y_val):
     return model
 
 
-def run_walk_forward(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    if df["date"].dt.tz is not None:
-        df["date"] = df["date"].dt.tz_convert(None)
+def run_walk_forward(df: pd.DataFrame, n_trials: int = 0) -> pd.DataFrame:
+    # df_full: every stock, every date — used for prediction at signal time.
+    # df_labeled: only top/bottom 30% extreme performers — used for training.
+    # Training on clean labels while predicting on the full universe is how
+    # quant funds actually operate: the model learns from confirmed extremes,
+    # then ranks all stocks and we select the top-N per day.
+    df_full = df.copy()
+    df_full["date"] = pd.to_datetime(df_full["date"])
+    if df_full["date"].dt.tz is not None:
+        df_full["date"] = df_full["date"].dt.tz_convert(None)
 
     feature_cols = get_feature_columns()
-    df     = build_target(df)
-    splits = get_walk_forward_splits(df)
+    df_labeled   = build_target(df_full)
+    splits       = get_walk_forward_splits(df_labeled)
 
     if not splits:
         log.error("No splits generated.")
         return pd.DataFrame()
 
+    # Optuna HPO: tune on the first fold's training split, apply to all folds.
+    lgbm_params = None
+    if n_trials > 0:
+        log.info(f"Running Optuna HPO — {n_trials} trials on fold-1 training data...")
+        first_train = df_labeled[splits[0][0]]
+        sd = np.sort(first_train["date"].unique())
+        sp = sd[int(len(sd) * 0.8)]
+        X_tune_tr  = first_train[first_train["date"] <  sp][feature_cols]
+        y_tune_tr  = first_train[first_train["date"] <  sp]["target"]
+        X_tune_val = first_train[first_train["date"] >= sp][feature_cols]
+        y_tune_val = first_train[first_train["date"] >= sp]["target"]
+        lgbm_params = tune_hyperparams(X_tune_tr, y_tune_tr, X_tune_val, y_tune_val, n_trials)
+        log.info("Optuna HPO complete — using tuned params for all folds.")
+
     all_preds    = []
     fold_metrics = []
 
     for fold_num, (train_mask, test_mask) in enumerate(splits):
-        train_df = df[train_mask]
-        test_df  = df[test_mask]
+        train_df       = df_labeled[train_mask]
+        test_df_labeled = df_labeled[test_mask]
 
         X_train, y_train = train_df[feature_cols], train_df["target"]
-        X_test,  y_test  = test_df[feature_cols],  test_df["target"]
+        X_test,  y_test  = test_df_labeled[feature_cols], test_df_labeled["target"]
 
-        # Temporal validation: split on the 80th-percentile date, not the 80th row.
-        # Positional split incorrectly interleaves tickers across time.
+        # Temporal validation split on the 80th-percentile date.
         sorted_dates = np.sort(train_df["date"].unique())
         split_date   = sorted_dates[int(len(sorted_dates) * 0.8)]
         tr_mask      = train_df["date"] <  split_date
@@ -168,23 +244,49 @@ def run_walk_forward(df: pd.DataFrame) -> pd.DataFrame:
         X_tr,  X_val = X_train[tr_mask],  X_train[val_mask]
         y_tr,  y_val = y_train[tr_mask],  y_train[val_mask]
 
-        date_range = f"{test_df['date'].min().date()} → {test_df['date'].max().date()}"
+        date_range = f"{test_df_labeled['date'].min().date()} → {test_df_labeled['date'].max().date()}"
         log.info(f"Fold {fold_num+1}/{len(splits)} [{date_range}] "
                  f"train={len(X_train):,} val={len(X_val):,} test={len(X_test):,}")
 
-        model = train_fold(X_tr, y_tr, X_val, y_val)
-        probs = model.predict_proba(X_test)[:, 1]
-        auc   = roc_auc_score(y_test, probs)
+        model = train_fold(X_tr, y_tr, X_val, y_val, params=lgbm_params)
 
-        # long leg: high confidence of outperformance
-        long_mask  = probs >= MIN_PROB
-        # short leg: high confidence of underperformance (symmetric threshold)
-        short_mask = probs <= (1.0 - MIN_PROB)
+        # AUC: evaluate on labeled test set (top/bottom 30% ground truth).
+        probs_labeled = model.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(y_test, probs_labeled)
 
-        long_prec = float(y_test[long_mask].mean())        if long_mask.sum()  > 10 else np.nan
-        short_prec = float((y_test[short_mask] == 0).mean()) if short_mask.sum() > 10 else np.nan
-        long_rate  = float(long_mask.mean())
-        short_rate = float(short_mask.mean())
+        # Full-universe prediction: score every stock on the test dates.
+        test_dates    = test_df_labeled["date"].unique()
+        test_df_full  = df_full[df_full["date"].isin(test_dates)].dropna(subset=feature_cols)
+        probs_full    = model.predict_proba(test_df_full[feature_cols])[:, 1]
+
+        # Top-N selection per day: take the TOP_N highest-confidence longs
+        # and TOP_N lowest-confidence shorts from the full universe.
+        fp = test_df_full[["date", "ticker", "Close", "fwd_ret_5d", "fwd_ret_21d"]].copy()
+        for col in ("vix", "spy_ret_21d", "target"):
+            if col in test_df_full.columns:
+                fp[col] = test_df_full[col].values
+        fp["prob_up"] = probs_full
+        fp["signal"]  = 0
+
+        for date, grp in fp.groupby("date"):
+            if len(grp) < TOP_N:
+                continue
+            fp.loc[grp["prob_up"].nlargest(TOP_N).index,  "signal"] =  1
+            fp.loc[grp["prob_up"].nsmallest(TOP_N).index, "signal"] = -1
+
+        # Precision/rate metrics: measure on the labeled subset that has ground truth.
+        fp_labeled = fp[fp["ticker"].isin(test_df_labeled["ticker"]) &
+                        fp["date"].isin(test_df_labeled["date"])]
+        fp_labeled = fp_labeled.merge(
+            test_df_labeled[["date", "ticker", "target"]].rename(columns={"target": "_target"}),
+            on=["date", "ticker"], how="left"
+        )
+        longs_l  = fp_labeled[(fp_labeled["signal"] ==  1) & fp_labeled["_target"].notna()]
+        shorts_l = fp_labeled[(fp_labeled["signal"] == -1) & fp_labeled["_target"].notna()]
+        long_prec  = float(longs_l["_target"].mean())           if len(longs_l)  > 5 else np.nan
+        short_prec = float((shorts_l["_target"] == 0).mean())   if len(shorts_l) > 5 else np.nan
+        long_rate  = float((fp["signal"] ==  1).sum()) / max(len(fp), 1)
+        short_rate = float((fp["signal"] == -1).sum()) / max(len(fp), 1)
 
         log.info(f"  {'AUC':>14}: {auc:.4f}")
         log.info(f"  {'Long prec':>14}: {long_prec:.4f}"  if not np.isnan(long_prec)  else f"  {'Long prec':>14}: n/a")
@@ -192,29 +294,18 @@ def run_walk_forward(df: pd.DataFrame) -> pd.DataFrame:
         log.info(f"  {'Long rate':>14}: {long_rate:.1%}   Short rate: {short_rate:.1%}")
 
         fold_metrics.append({
-            "fold":         fold_num + 1,
-            "train_size":   len(X_train),
-            "test_size":    len(X_test),
-            "auc":          auc,
-            "long_prec":    long_prec,
-            "short_prec":   short_prec,
-            "long_rate":    long_rate,
-            "short_rate":   short_rate,
+            "fold":        fold_num + 1,
+            "train_size":  len(X_train),
+            "test_size":   len(test_df_full),
+            "auc":         auc,
+            "long_prec":   long_prec,
+            "short_prec":  short_prec,
+            "long_rate":   long_rate,
+            "short_rate":  short_rate,
         })
 
-        save_cols = ["date", "ticker", "Close", "fwd_ret_21d", "target"]
-        for col in ("vix", "spy_ret_21d"):
-            if col in test_df.columns:
-                save_cols.append(col)
-
-        fp            = test_df[save_cols].copy()
-        fp["prob_up"] = probs
-        # signal: 1 = long, -1 = short, 0 = no position
-        fp["signal"]  = 0
-        fp.loc[long_mask,  "signal"] =  1
-        fp.loc[short_mask, "signal"] = -1
-        fp["fold"]    = fold_num + 1
-        all_preds.append(fp)
+        fp["fold"] = fold_num + 1
+        all_preds.append(fp[fp["signal"] != 0])
 
     predictions = pd.concat(all_preds, ignore_index=True)
     predictions["date"] = pd.to_datetime(predictions["date"])
@@ -234,16 +325,15 @@ def run_walk_forward(df: pd.DataFrame) -> pd.DataFrame:
     print(f"  {'Mean Short Signal Rate':<36} {mdf['short_rate'].mean():.1%}")
     print("─" * 72 + "\n")
 
-    # Production model: retrain on the full labeled dataset so it sees the most
-    # recent data. Walk-forward CV above is for evaluation only.
+    # Production model: retrain on the full labeled dataset.
     log.info("Training final model on full dataset...")
-    sorted_dates  = np.sort(df["date"].unique())
+    sorted_dates  = np.sort(df_labeled["date"].unique())
     split_date    = sorted_dates[int(len(sorted_dates) * 0.8)]
-    X_tr_all      = df[df["date"] <  split_date][feature_cols]
-    y_tr_all      = df[df["date"] <  split_date]["target"]
-    X_val_all     = df[df["date"] >= split_date][feature_cols]
-    y_val_all     = df[df["date"] >= split_date]["target"]
-    final_model   = train_fold(X_tr_all, y_tr_all, X_val_all, y_val_all)
+    X_tr_all      = df_labeled[df_labeled["date"] <  split_date][feature_cols]
+    y_tr_all      = df_labeled[df_labeled["date"] <  split_date]["target"]
+    X_val_all     = df_labeled[df_labeled["date"] >= split_date][feature_cols]
+    y_val_all     = df_labeled[df_labeled["date"] >= split_date]["target"]
+    final_model   = train_fold(X_tr_all, y_tr_all, X_val_all, y_val_all, params=lgbm_params)
     save_model(final_model, feature_cols)
     run_shap_analysis(final_model, X_val_all, feature_cols)
 

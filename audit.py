@@ -45,22 +45,25 @@ print(f"   Predictions : {len(preds):,} rows")
 print(f"   Date range  : {preds['date'].min().date()} → {preds['date'].max().date()}")
 print(f"   Tickers     : {preds['ticker'].nunique()}")
 print(f"   Folds       : {preds['fold'].nunique()}")
-print(f"   Signal rate : {preds['signal'].mean():.1%}")
+print(f"   Signal rate : {(preds['signal'] != 0).mean():.1%}")
 
 
 # ── 2. Lookahead bias ─────────────────────────────────────────────────────────
 # A suspiciously high correlation between model confidence and future returns
 # would suggest the model has access to information it shouldn't.
 
-print(f"\n2. LOOKAHEAD BIAS CHECK")
-corr = preds["prob_up"].corr(preds["fwd_ret_5d"])
-print(f"   Corr(prob_up, fwd_ret_5d): {corr:.4f}")
-if abs(corr) > 0.15:
-    print("   ⚠ HIGH — possible lookahead; investigate feature construction")
-elif abs(corr) > 0.05:
-    print("   ✓ Moderate — expected for a working model")
+print(f"\n2. LOOKAHEAD BIAS CHECK  (5d hold horizon)")
+if "fwd_ret_5d" in preds.columns:
+    corr = preds["prob_up"].corr(preds["fwd_ret_5d"])
+    print(f"   Corr(prob_up, fwd_ret_5d): {corr:.4f}")
+    if abs(corr) > 0.15:
+        print("   ⚠ HIGH — possible lookahead; investigate feature construction")
+    elif abs(corr) > 0.05:
+        print("   ✓ Moderate — expected for a working model")
+    else:
+        print("   ~ Low — model may have weak signal (or features are too smooth)")
 else:
-    print("   ~ Low — model may have weak signal (or features are too smooth)")
+    print("   fwd_ret_5d not in predictions — re-run training.")
 
 
 # ── 3. Walk-forward structure ─────────────────────────────────────────────────
@@ -74,7 +77,7 @@ for fold in folds:
     fold_ranges[fold] = (fd["date"].min(), fd["date"].max())
     n = len(fd)
     print(f"   Fold {fold}: {fd['date'].min().date()} → {fd['date'].max().date()} "
-          f"| n={n:,} | signals={fd['signal'].sum():,}")
+          f"| n={n:,} | signals={(fd['signal'] != 0).sum():,}")
 
 gap_or_overlap = False
 for i in range(1, len(folds)):
@@ -94,50 +97,57 @@ if not gap_or_overlap:
 
 # ── 4. Return sanity check ────────────────────────────────────────────────────
 
-print(f"\n4. RETURN SANITY CHECK")
-extreme = preds[preds["fwd_ret_5d"].abs() > 0.5]
-print(f"   Returns > ±50% in 5 days: {len(extreme)} ({len(extreme)/len(preds):.2%})")
-if len(extreme) > 0:
-    print(extreme[["date", "ticker", "fwd_ret_5d"]].head(5).to_string(index=False))
+print(f"\n4. RETURN SANITY CHECK  (5d forward returns)")
+if "fwd_ret_5d" in preds.columns:
+    extreme = preds[preds["fwd_ret_5d"].abs() > 0.5]
+    print(f"   Returns > ±50% in 5 days: {len(extreme)} ({len(extreme)/len(preds):.2%})")
+    if len(extreme) > 0:
+        print(extreme[["date", "ticker", "fwd_ret_5d"]].head(5).to_string(index=False))
 
-print(f"\n   fwd_ret_5d distribution:")
-d = preds["fwd_ret_5d"]
-print(f"   Mean  : {d.mean():.4f}   Std: {d.std():.4f}")
-print(f"   Min   : {d.min():.4f}   Max: {d.max():.4f}")
-print(f"   Skew  : {d.skew():.4f}   (negative skew expected for mean-reversion)")
+    print(f"\n   fwd_ret_5d distribution:")
+    d = preds["fwd_ret_5d"]
+    print(f"   Mean  : {d.mean():.4f}   Std: {d.std():.4f}")
+    print(f"   Min   : {d.min():.4f}   Max: {d.max():.4f}")
+    print(f"   Skew  : {d.skew():.4f}   (negative skew expected for mean-reversion)")
+else:
+    print("   fwd_ret_5d not in predictions — re-run training.")
 
 
 # ── 5. Per-fold performance ───────────────────────────────────────────────────
 # Performance decay over time signals regime change or overfitting.
 
-print(f"\n5. PERFORMANCE BY FOLD")
-signals = preds[preds["signal"] == 1]
+print(f"\n5. PERFORMANCE BY FOLD  (long signals, 5d return)")
+has_spy21 = "spy_ret_5d" in preds.columns
+long_signals = preds[preds["signal"] == 1]
 for fold in folds:
-    fs = signals[signals["fold"] == fold]
+    fs = long_signals[long_signals["fold"] == fold]
     if len(fs) == 0:
-        print(f"   Fold {fold}: no signals")
+        print(f"   Fold {fold}: no long signals")
+        continue
+    if "fwd_ret_5d" not in fs.columns:
+        print(f"   Fold {fold}: fwd_ret_5d missing")
         continue
     mean_ret = fs["fwd_ret_5d"].mean()
     win_rate = (fs["fwd_ret_5d"] > 0).mean()
-    beat_spy = (fs["fwd_ret_5d"] > fs["spy_ret_5d"]).mean() if "spy_ret_5d" in fs.columns else np.nan
-    n = len(fs)
-    beat_str = f" | beat_spy={beat_spy:.1%}" if not np.isnan(beat_spy) else ""
-    print(f"   Fold {fold}: n={n:>4,} | ret={mean_ret:.3%} | wr={win_rate:.1%}{beat_str}")
+    beat_str = ""
+    if has_spy21:
+        beat_spy = (fs["fwd_ret_5d"] > fs["spy_ret_5d"]).mean()
+        beat_str = f" | beat_spy={beat_spy:.1%}"
+    print(f"   Fold {fold}: n={len(fs):>4,} | ret={mean_ret:.3%} | wr={win_rate:.1%}{beat_str}")
 
 
 # ── 6. VIX regime consistency ─────────────────────────────────────────────────
 # Check that the VIX range seen during training covers the range at signal time.
-# A model trained only on calm markets will be poorly calibrated in high-VIX periods.
 
 print(f"\n6. VIX REGIME CONSISTENCY")
 if "vix" in preds.columns:
     all_vix = preds["vix"].dropna()
-    sig_vix = preds[preds["signal"] == 1]["vix"].dropna()
+    sig_vix = preds[preds["signal"] != 0]["vix"].dropna()
     print(f"   Training universe  — VIX mean: {all_vix.mean():.1f}  "
           f"range [{all_vix.min():.0f}, {all_vix.max():.0f}]")
     print(f"   Signals fired      — VIX mean: {sig_vix.mean():.1f}  "
           f"range [{sig_vix.min():.0f}, {sig_vix.max():.0f}]")
-    pct_high = (all_vix >= 25).mean()
+    pct_high     = (all_vix >= 25).mean()
     pct_sig_high = (sig_vix >= 25).mean()
     print(f"   VIX ≥ 25 in training: {pct_high:.1%}  |  in signals: {pct_sig_high:.1%}")
     if abs(pct_high - pct_sig_high) > 0.10:
@@ -150,23 +160,25 @@ else:
 
 # ── 7. VIX regime performance ─────────────────────────────────────────────────
 
-print(f"\n7. VIX REGIME PERFORMANCE (signals only)")
-if "vix" in preds.columns:
-    sig = preds[preds["signal"] == 1].copy()
+print(f"\n7. VIX REGIME PERFORMANCE  (all signals, 5d return)")
+if "vix" in preds.columns and "fwd_ret_5d" in preds.columns:
+    sig = preds[preds["signal"] != 0].copy()
+    sig["direction"] = sig["signal"].astype(float)
+    sig["adj_ret"]   = sig["fwd_ret_5d"] * sig["direction"]
     for label, mask in [
-        ("VIX < 15  (calm)",    sig["vix"] < 15),
+        ("VIX < 15  (calm)",     sig["vix"] < 15),
         ("VIX 15-20 (normal)",  (sig["vix"] >= 15) & (sig["vix"] < 20)),
-        ("VIX 20-30 (fear)",    (sig["vix"] >= 20) & (sig["vix"] < 30)),
-        ("VIX > 30  (crisis)",  sig["vix"] >= 30),
+        ("VIX 20-30 (elevated)", (sig["vix"] >= 20) & (sig["vix"] < 30)),
+        ("VIX > 30  (fear)",     sig["vix"] >= 30),
     ]:
         subset = sig[mask]
         if len(subset) == 0:
             continue
-        ret = subset["fwd_ret_5d"].mean()
-        wr  = (subset["fwd_ret_5d"] > 0).mean()
-        print(f"   {label}: n={len(subset):>5,} | ret={ret:.3%} | wr={wr:.1%}")
+        ret = subset["adj_ret"].mean()
+        wr  = (subset["adj_ret"] > 0).mean()
+        print(f"   {label}: n={len(subset):>5,} | dir-adj ret={ret:.3%} | wr={wr:.1%}")
 else:
-    print("   VIX data not available.")
+    print("   VIX or fwd_ret_5d data not available.")
 
 
 # ── 8. Survivorship bias ──────────────────────────────────────────────────────

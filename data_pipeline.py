@@ -137,7 +137,7 @@ def add_returns(df: pd.DataFrame) -> pd.DataFrame:
     df["ret_10d"] = close.pct_change(10)
     df["ret_20d"] = close.pct_change(20)
     df["fwd_ret_5d"]  = close.pct_change(5).shift(-5)
-    df["fwd_ret_21d"] = close.pct_change(21).shift(-21)  # 1-month forward: reversal is stronger here
+    df["fwd_ret_21d"] = close.pct_change(21).shift(-21)
     return df
 
 

@@ -340,11 +340,35 @@ class Ra(tk.Tk):
                            "~5 min  ·  retrain monthly")
         card2.pack(fill="x", pady=(0, 8))
         row2 = tk.Frame(card2, bg=CARD)
-        row2.pack(fill="x", padx=16, pady=(0, 14))
+        row2.pack(fill="x", padx=16, pady=(0, 8))
         self._btn_train = self._btn(row2, "run", self._do_train)
         self._btn_train.pack(side="left")
         self._spin_train = tk.Label(row2, text="", bg=CARD, fg=MUTED, font=F_SM)
         self._spin_train.pack(side="left", padx=(10, 0))
+
+        # optuna controls
+        opt_row = tk.Frame(card2, bg=CARD)
+        opt_row.pack(fill="x", padx=16, pady=(0, 14))
+        tk.Label(opt_row, text="optuna trials", bg=CARD, fg=MUTED, font=F_SM).pack(side="left")
+        self._n_trials = tk.IntVar(value=0)
+        self._trials_lbl = tk.Label(opt_row, text="off", bg=CARD, fg=MUTED,
+                                    font=("Segoe UI", 9, "bold"), width=5)
+        self._trials_lbl.pack(side="left", padx=(8, 0))
+
+        def _on_trials(v):
+            n = int(float(v))
+            self._n_trials.set(n)
+            if n == 0:
+                self._trials_lbl.configure(text="off", fg=MUTED)
+            else:
+                self._trials_lbl.configure(text=str(n), fg=GOLD)
+
+        ttk.Scale(opt_row, from_=0, to=150, variable=self._n_trials,
+                  orient="horizontal", length=180,
+                  command=_on_trials).pack(side="left", padx=8)
+        tk.Label(opt_row,
+                 text="0 = fixed params  ·  50–100 = recommended  ·  adds ~10 min",
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
 
         self._spin_job = None   # pending after() id for spinner animation
 
@@ -392,15 +416,17 @@ class Ra(tk.Tk):
 
         sf = tk.Frame(f, bg=BG)
         sf.pack(fill="x", padx=20, pady=(0, 10))
-        tk.Label(sf, text="min confidence", bg=BG, fg=MUTED, font=F_SM).pack(side="left")
-        self._min_prob = tk.DoubleVar(value=0.52)
-        self._plbl = tk.Label(sf, text="52%", bg=BG, fg=GOLD,
-                              font=("Segoe UI", 9, "bold"), width=4)
-        self._plbl.pack(side="left", padx=(6, 0))
-        ttk.Scale(sf, from_=0.50, to=0.80, variable=self._min_prob,
+        tk.Label(sf, text="top N per side", bg=BG, fg=MUTED, font=F_SM).pack(side="left")
+        self._top_n = tk.IntVar(value=5)
+        self._nlbl  = tk.Label(sf, text="5", bg=BG, fg=GOLD,
+                               font=("Segoe UI", 9, "bold"), width=4)
+        self._nlbl.pack(side="left", padx=(6, 0))
+        ttk.Scale(sf, from_=1, to=20, variable=self._top_n,
                   orient="horizontal", length=180,
-                  command=lambda v: self._plbl.configure(text=f"{float(v):.0%}")).pack(
+                  command=lambda v: self._nlbl.configure(text=str(int(float(v))))).pack(
                       side="left", padx=8)
+        tk.Label(sf, text="long + N short signals per day  ·  hold 5 days",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
 
         cols = ("ticker", "side", "sector", "conf", "price", "rsi", "zscore", "sect_z", "bb")
         self._tree = ttk.Treeview(f, columns=cols, show="headings",
@@ -587,16 +613,19 @@ class Ra(tk.Tk):
         if not DATA.exists():
             messagebox.showwarning("ra", "download data first  (step 01)")
             return
-        self._run(self._train_task, self._btn_train, self._spin_train)
+        self._run(self._train_task, self._btn_train, self._spin_train,
+                  self._n_trials.get())
 
-    def _train_task(self):
+    def _train_task(self, n_trials: int = 0):
         logging.info("training model...")
+        if n_trials > 0:
+            logging.info(f"optuna HPO enabled — {n_trials} trials")
         from model_training import run_walk_forward
         df = pd.read_parquet(DATA)
         df["date"] = pd.to_datetime(df["date"])
         if df["date"].dt.tz is not None:
             df["date"] = df["date"].dt.tz_convert(None)
-        preds = run_walk_forward(df)
+        preds = run_walk_forward(df, n_trials=n_trials)
         if preds is None or preds.empty:
             logging.error("training failed — no predictions generated")
             return
@@ -612,7 +641,7 @@ class Ra(tk.Tk):
     def _signals_task(self):
         logging.info("generating signals...")
         from signal_generator import generate_signals
-        sigs = generate_signals(min_prob=self._min_prob.get())
+        sigs = generate_signals(top_n=self._top_n.get())
         self._sigs = sigs if sigs is not None else pd.DataFrame()
 
         if not self._sigs.empty and "vix" in self._sigs.columns:
@@ -626,7 +655,7 @@ class Ra(tk.Tk):
         if   v < 15: vc, vlbl = AMBER, f"vix {v:.1f}  calm"
         elif v < 20: vc, vlbl = FG,    f"vix {v:.1f}  normal"
         elif v < 30: vc, vlbl = GREEN, f"vix {v:.1f}  elevated"
-        else:        vc, vlbl = RED,   f"vix {v:.1f}  extreme"
+        else:        vc, vlbl = RED,   f"vix {v:.1f}  fear"
 
         if disp is not None:
             if   disp < 0.007: dc, dlbl = RED,   f"disp {disp:.3f}  correlated"
@@ -646,22 +675,22 @@ class Ra(tk.Tk):
             self._sig_lbl.configure(text="no signals above threshold", fg=MUTED)
             return
 
-        for _, r in sigs.iterrows():
-            side    = r.get("side", "long")
+        for r in sigs.itertuples(index=False):
+            side    = getattr(r, "side", "long")
             is_long = side == "long"
-            conf    = r["prob_up"] if is_long else 1.0 - r["prob_up"]
+            conf    = r.prob_up if is_long else 1.0 - r.prob_up
             hi      = conf >= 0.65
             tag     = ("hi_long" if hi else "long") if is_long else ("hi_short" if hi else "short")
             self._tree.insert("", "end", values=(
-                r.get("ticker", ""),
+                getattr(r, "ticker", ""),
                 side,
-                r.get("sector_etf", ""),
+                getattr(r, "sector_etf", ""),
                 f"{conf:.1%}",
-                f"${r.get('current_price', 0):.2f}",
-                f"{r.get('rsi_14', 0):.1f}",
-                f"{r.get('zscore_20', 0):.2f}",
-                f"{r.get('sector_rel_zscore', 0):.2f}",
-                f"{r.get('bb_pos_20', 0):.3f}",
+                f"${getattr(r, 'current_price', 0):.2f}",
+                f"{getattr(r, 'rsi_14', 0):.1f}",
+                f"{getattr(r, 'zscore_20', 0):.2f}",
+                f"{getattr(r, 'sector_rel_zscore', 0):.2f}",
+                f"{getattr(r, 'bb_pos_20', 0):.3f}",
             ), tags=(tag,))
 
         self._tree.tag_configure("long",     foreground=FG)
@@ -772,8 +801,11 @@ class Ra(tk.Tk):
             canvas.configure(scrollregion=canvas.bbox("all"))
         canvas.bind("<Configure>", _on_resize)
         inner.bind("<Configure>", _on_frame)
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        def _scroll(e):
+            if self._page == "tahatools":
+                canvas.yview_scroll(-1 * (e.delta // 120), "units")
+        canvas.bind_all("<MouseWheel>", _scroll)
 
         def _section(title, desc):
             sec = tk.Frame(inner, bg=CARD)
@@ -1168,10 +1200,10 @@ class Ra(tk.Tk):
   vix & strategy edge
   ──────────────────────────────────────────────────────
 
-    < 15    calm (amber)    trending market, mean reversion weaker
-    15–20   normal (white)  moderate, balanced conditions
+    < 15    calm (amber)     trending market, mean reversion weaker
+    15–20   normal (white)   moderate, balanced conditions
     20–30   elevated (green) best conditions — reversion strengthens
-    > 30    extreme (red)   high risk, chaotic correlations
+    > 30    fear (red)       high risk, correlations spike, edge degrades
 
   ──────────────────────────────────────────────────────
   credits

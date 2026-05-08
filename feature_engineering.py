@@ -62,12 +62,16 @@ def get_market_context(start: str, end: str) -> pd.DataFrame:
         spy.index = pd.to_datetime(spy.index)
         ctx["spy_ret"]     = spy["Close"].pct_change()
         ctx["spy_ret_5d"]  = spy["Close"].pct_change(5).shift(-5)
-        ctx["spy_ret_21d"] = spy["Close"].pct_change(21).shift(-21)  # 1-month SPY return for target
+        ctx["spy_ret_21d"] = spy["Close"].pct_change(21).shift(-21)
         log.info(f"SPY loaded: {len(spy)} days")
     except Exception as e:
-        log.warning(f"SPY failed: {e}.")
-        ctx["spy_ret"]    = 0.0
-        ctx["spy_ret_5d"] = 0.0
+        log.error(
+            f"SPY download failed: {e}  —  spy_ret_21d will be NaN for all dates. "
+            "Training will fail. Check network and re-run step 01."
+        )
+        ctx["spy_ret"]     = 0.0
+        ctx["spy_ret_5d"]  = np.nan
+        ctx["spy_ret_21d"] = np.nan
 
     return ctx.dropna(how="all")
 
@@ -222,9 +226,16 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
     ctx_reset["date"]   = ctx_reset["date"].astype("datetime64[ns]")
     result = result.merge(ctx_reset, on="date", how="left")
 
+    if result["spy_ret_21d"].isna().all():
+        raise RuntimeError(
+            "spy_ret_21d is entirely NaN — SPY download failed during feature engineering. "
+            "Check your internet connection and re-run step 01."
+        )
+
     result["vix_low"]    = (result["vix"] < 15).astype(float)
     result["vix_normal"] = ((result["vix"] >= 15) & (result["vix"] < 20)).astype(float)
-    result["vix_high"]   = (result["vix"] >= 20).astype(float)
+    result["vix_high"]   = ((result["vix"] >= 20) & (result["vix"] < 30)).astype(float)
+    result["vix_fear"]   = (result["vix"] >= 30).astype(float)
 
     # Sector-relative z-score
     log.info("Computing sector-relative features...")
@@ -267,6 +278,16 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
 
     # Cross-sectional rank features: absolute RSI tells you little;
     # "most oversold stock in XLK today" is the actual signal.
+    # Sector one-hot: lets the model learn sector-specific biases (e.g. XLRE
+    # longs fail in rising-rate environments even when technically oversold).
+    log.info("Computing sector one-hot features...")
+    if "sector_etf" in result.columns:
+        for etf in ALL_SECTOR_ETFS:
+            result[f"sector_{etf}"] = (result["sector_etf"] == etf).astype(float)
+    else:
+        for etf in ALL_SECTOR_ETFS:
+            result[f"sector_{etf}"] = 0.0
+
     log.info("Computing cross-sectional rank features...")
     xs_cols = ["rsi_14", "zscore_20", "zscore_60", "dist_ma20", "ret_5d", "sector_rel_zscore",
                "dist_52w_high", "vol_ratio_20"]
@@ -298,8 +319,9 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
     log.info("Regime dispersion done.")
 
     # Drop rows missing core features or target; fill optional enrichment with neutral values
-    soft_cols = {"vix", "vix_low", "vix_normal", "vix_high", "sector_rel_zscore",
-                 "xs_disp_5d", "xs_disp_20d"}
+    sector_onehot_cols = {f"sector_{etf}" for etf in ALL_SECTOR_ETFS}
+    soft_cols = {"vix", "vix_low", "vix_normal", "vix_high", "vix_fear",
+                 "sector_rel_zscore", "xs_disp_5d", "xs_disp_20d"} | sector_onehot_cols
     core_cols = [c for c in get_feature_columns()
                  if c not in soft_cols and "_xs_rank" not in c and "_sec_rank" not in c]
     n_before = len(result)
@@ -309,6 +331,7 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
     result["vix_low"]           = result["vix_low"].fillna(0.0)
     result["vix_normal"]        = result["vix_normal"].fillna(1.0)
     result["vix_high"]          = result["vix_high"].fillna(0.0)
+    result["vix_fear"]          = result["vix_fear"].fillna(0.0)
     result["sector_rel_zscore"] = result["sector_rel_zscore"].fillna(0.0)
     # xs/sec rank NaN → 0.5 (neutral)
     xs_rank_cols = [c for c in result.columns if "_xs_rank" in c or "_sec_rank" in c]
@@ -333,7 +356,7 @@ def get_feature_columns() -> list:
         "dist_52w_high", "dist_52w_low",
         "intraday_range",
         "ret_1d", "ret_2d", "ret_5d", "ret_10d", "ret_20d",
-        "vix", "vix_low", "vix_normal", "vix_high",
+        "vix", "vix_low", "vix_normal", "vix_high", "vix_fear",
         "sector_rel_zscore",
         # cross-sectional ranks (xs = vs all S&P 500, sec = within sector)
         "rsi_14_xs_rank", "zscore_20_xs_rank", "zscore_60_xs_rank",
@@ -342,9 +365,10 @@ def get_feature_columns() -> list:
         "rsi_14_sec_rank", "zscore_20_sec_rank",
         "ret_5d_sec_rank", "sector_rel_zscore_sec_rank",
         # regime gate: cross-sectional return dispersion
-        # low = stocks correlated / macro shock → signals less reliable
-        # high = stocks differentiating → signals more reliable
         "xs_disp_5d", "xs_disp_20d",
+        # sector identity — lets model learn per-sector biases vs SPY
+        "sector_XLK", "sector_XLF", "sector_XLV", "sector_XLE", "sector_XLI",
+        "sector_XLY", "sector_XLP", "sector_XLU", "sector_XLB", "sector_XLRE", "sector_XLC",
     ]
 
 

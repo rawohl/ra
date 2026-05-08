@@ -2,15 +2,15 @@
 S&P 500 Mean Reversion Signal System v3
 Phase 4: Backtesting
 
-v3 changes:
-  - VIX hard filter removed. The model already uses vix / vix_low / vix_normal / vix_high
-    as features, so post-hoc filtering cherry-picks calm periods and inflates results.
-  - Confidence-weighted position sizing: higher prob_up → larger relative weight.
-    Equal-weight treated a 59% signal identically to a 75% signal.
-  - More realistic round-trip cost: 5 bps commission + 3 bps slippage per side = 16 bps total.
-  - SPY benchmark line on equity curve for direct comparison.
-  - Rolling 63-day Sharpe subplot to show strategy stability over time.
-  - Calmar ratio (annualized return / max drawdown) added to metrics.
+Key design choices:
+  - Overlapping-cohort equity curve: a signal entered on day T contributes
+    net/HOLD_DAYS per day to the portfolio for each of the next HOLD_DAYS
+    trading days, correctly modelling simultaneous open positions.
+  - Position sizing via confidence weight applied once (in the weighted
+    average across open positions), not baked into per-trade net return.
+  - Trade-level win/loss uses the full 21d net return (gross - round-trip
+    cost), which is the natural unit for a 21d holding strategy.
+  - SPY benchmark and rolling Sharpe subplot for visual context.
 """
 
 import pandas as pd
@@ -23,25 +23,20 @@ import matplotlib.dates as mdates
 from pathlib import Path
 import logging
 
+from config import MIN_PROB, HOLD_DAYS, INITIAL_CAPITAL, ROUND_TRIP_COST
+
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-COMMISSION      = 0.0005   # 5 bps per side
-SLIPPAGE        = 0.0003   # 3 bps per side (market impact / spread leakage)
-ROUND_TRIP_COST = (COMMISSION + SLIPPAGE) * 2   # 16 bps total per trade
-MIN_PROB        = 0.52
-INITIAL_CAPITAL = 10_000
 
-
-def _confidence_weight(prob_up: float) -> float:
+def _confidence_weight(conf: float) -> float:
     """
-    Scale position size linearly with signal confidence.
-    At MIN_PROB threshold → weight 0.5 (half size).
-    At 100% confidence   → weight 1.5 (one-and-a-half size).
-    Average weight ≈ 1.0 across the signal distribution.
+    Linear position-size scaler in [0.5, 1.5].
+    conf = MIN_PROB  → weight 0.5 (half size)
+    conf = 1.0       → weight 1.5 (one-and-a-half size)
+    Expected mean ≈ 1.0 across typical signal distributions.
     """
-    excess = (prob_up - MIN_PROB) / (1.0 - MIN_PROB)
-    return max(0.5, 0.5 + excess)
+    return max(0.5, 0.5 + (conf - MIN_PROB) / (1.0 - MIN_PROB))
 
 
 def run_backtest(predictions: pd.DataFrame) -> dict:
@@ -52,48 +47,64 @@ def run_backtest(predictions: pd.DataFrame) -> dict:
     predictions = predictions.sort_values("date")
 
     signals = predictions[predictions["signal"] != 0].copy()
-    longs  = (signals["signal"] ==  1).sum()
-    shorts = (signals["signal"] == -1).sum()
-    log.info(f"Signals: {len(signals):,} across {signals['date'].nunique()} days  "
-             f"({longs:,} long  ·  {shorts:,} short)")
-
     if len(signals) == 0:
-        log.error("No signals to backtest. Lower MIN_PROB threshold.")
+        log.error("No signals to backtest.")
         return {}
 
-    trades = []
-    for _, row in signals.iterrows():
-        is_long = row["signal"] == 1
-        # confidence weight: for longs use prob_up, for shorts use 1-prob_up
-        conf    = row["prob_up"] if is_long else (1.0 - row["prob_up"])
-        weight  = _confidence_weight(conf)
-        # pro-rate over 21-day hold; shorts flip the sign of the return
-        raw = row["fwd_ret_21d"] / 21 * (1 if is_long else -1)
-        net = raw * weight - ROUND_TRIP_COST / 21
-        trades.append({
-            "date":       row["date"],
-            "ticker":     row["ticker"],
-            "side":       "long" if is_long else "short",
-            "prob_up":    row["prob_up"],
-            "weight":     weight,
-            "raw_return": raw,
-            "net_return": net,
-            "win":        net > 0,
+    n_long  = (signals["signal"] ==  1).sum()
+    n_short = (signals["signal"] == -1).sum()
+    log.info(f"Signals: {len(signals):,} across {signals['date'].nunique()} days  "
+             f"({n_long:,} long  ·  {n_short:,} short)")
+
+    # ── Per-trade records ─────────────────────────────────────────────────────
+    # Net P&L for a trade = full 21d gross return (direction-adjusted) minus
+    # the one-time round-trip transaction cost.  Weight is kept separate so it
+    # only enters position sizing, not the win/loss determination.
+    trade_rows = []
+    for row in signals.itertuples(index=False):
+        is_long   = row.signal == 1
+        conf      = row.prob_up if is_long else 1.0 - row.prob_up
+        weight    = _confidence_weight(conf)
+        direction = 1 if is_long else -1
+        net       = row.fwd_ret_5d * direction - ROUND_TRIP_COST
+        trade_rows.append({
+            "date":    row.date,
+            "ticker":  row.ticker,
+            "side":    "long" if is_long else "short",
+            "prob_up": row.prob_up,
+            "weight":  weight,
+            "net":     net,
+            "win":     net > 0,
         })
 
-    trades_df = pd.DataFrame(trades)
+    trades_df = pd.DataFrame(trade_rows)
 
-    # Daily P&L: confidence-weighted average of all positions that day
-    def _weighted_daily(g):
-        return np.average(g["net_return"], weights=g["weight"])
+    # ── Overlapping-cohort equity curve ───────────────────────────────────────
+    # A position entered on trading day T earns net/HOLD_DAYS per day for each
+    # of the next HOLD_DAYS trading days.  Confidence weight controls how much
+    # that position contributes to the portfolio's weighted daily return.
+    # Accumulate into fixed-size arrays indexed by position in the date list.
+    all_dates = np.array(sorted(predictions["date"].unique()))
+    date_pos  = {d: i for i, d in enumerate(all_dates)}
+    n_total   = len(all_dates)
+    net_sum    = np.zeros(n_total)
+    weight_sum = np.zeros(n_total)
 
-    daily = (
-        trades_df.groupby("date")
-        .apply(_weighted_daily)
-        .rename("daily_return")
-        .reset_index()
-        .sort_values("date")
-    )
+    for row in trades_df.itertuples(index=False):
+        start = date_pos.get(row.date, -1)
+        if start < 0:
+            continue
+        end        = min(start + HOLD_DAYS, n_total)
+        daily_net  = row.net / HOLD_DAYS
+        net_sum[start:end]    += daily_net * row.weight
+        weight_sum[start:end] += row.weight
+
+    active = weight_sum > 0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        daily_return = np.where(active, net_sum / weight_sum, np.nan)
+
+    daily = pd.DataFrame({"date": all_dates, "daily_return": daily_return})
+    daily = daily.dropna(subset=["daily_return"]).reset_index(drop=True)
     daily["equity"] = INITIAL_CAPITAL * (1 + daily["daily_return"]).cumprod()
 
     # Rolling 63-day (≈ 1 quarter) Sharpe ratio
@@ -102,25 +113,26 @@ def run_backtest(predictions: pd.DataFrame) -> dict:
         (daily["daily_return"].rolling(63).std() * np.sqrt(252) + 1e-9)
     )
 
+    # ── Aggregate metrics ─────────────────────────────────────────────────────
     returns      = daily["daily_return"]
-    total_return = (daily["equity"].iloc[-1] / INITIAL_CAPITAL) - 1
+    total_return = daily["equity"].iloc[-1] / INITIAL_CAPITAL - 1
     n_years      = len(daily) / 252
-    ann_return   = (1 + total_return) ** (1 / n_years) - 1 if n_years > 0 else 0
-    sharpe       = (returns.mean() * 252) / (returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+    ann_return   = (1 + total_return) ** (1 / max(n_years, 1e-9)) - 1
+    sharpe       = returns.mean() * 252 / (returns.std() * np.sqrt(252)) if returns.std() > 0 else 0.0
 
     equity      = daily["equity"]
     rolling_max = equity.cummax()
     drawdown    = (equity - rolling_max) / rolling_max
-    max_dd      = drawdown.min()
-    calmar      = ann_return / abs(max_dd) if max_dd != 0 else np.inf
-
-    win_rate = trades_df["win"].mean()
-    avg_win  = trades_df[trades_df["win"]]["net_return"].mean()
-    avg_loss = trades_df[~trades_df["win"]]["net_return"].mean()
-    pf       = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
+    max_dd      = float(drawdown.min())
+    calmar      = ann_return / abs(max_dd) if max_dd < 0 else np.inf
 
     long_df  = trades_df[trades_df["side"] == "long"]
     short_df = trades_df[trades_df["side"] == "short"]
+    wins     = trades_df[trades_df["win"]]
+    losses   = trades_df[~trades_df["win"]]
+    avg_win  = float(wins["net"].mean())  if len(wins)   > 0 else np.nan
+    avg_loss = float(losses["net"].mean()) if len(losses) > 0 else np.nan
+    pf       = abs(avg_win / avg_loss) if (avg_loss and avg_loss != 0) else np.inf
 
     metrics = {
         "total_return":      total_return,
@@ -128,18 +140,18 @@ def run_backtest(predictions: pd.DataFrame) -> dict:
         "sharpe_ratio":      sharpe,
         "calmar_ratio":      calmar,
         "max_drawdown":      max_dd,
-        "win_rate":          win_rate,
+        "win_rate":          trades_df["win"].mean(),
         "avg_win":           avg_win,
         "avg_loss":          avg_loss,
         "profit_factor":     pf,
         "total_trades":      len(trades_df),
         "long_trades":       len(long_df),
         "short_trades":      len(short_df),
-        "long_win_rate":     long_df["win"].mean()  if len(long_df)  else np.nan,
-        "short_win_rate":    short_df["win"].mean() if len(short_df) else np.nan,
+        "long_win_rate":     long_df["win"].mean()  if len(long_df)  > 0 else np.nan,
+        "short_win_rate":    short_df["win"].mean() if len(short_df) > 0 else np.nan,
         "trading_days":      len(daily),
-        "signals_per_day":   len(trades_df) / trades_df["date"].nunique(),
-        "final_equity":      daily["equity"].iloc[-1],
+        "signals_per_day":   len(trades_df) / max(trades_df["date"].nunique(), 1),
+        "final_equity":      float(daily["equity"].iloc[-1]),
     }
 
     return {"metrics": metrics, "trades": trades_df, "daily": daily, "drawdown": drawdown}
