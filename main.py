@@ -32,9 +32,10 @@ F_SM  = ("Segoe UI",  9)
 F_H   = ("Segoe UI", 13, "bold")
 F_LOG = ("Consolas",  9)
 
-DATA  = Path("data/clean/featured.parquet")
-MODEL = Path("models/model.pkl")
-PREDS = Path("data/clean/predictions.parquet")
+DATA   = Path("data/clean/featured.parquet")
+MASTER = Path("data/clean/master.parquet")
+MODEL  = Path("models/model.pkl")
+PREDS  = Path("data/clean/predictions.parquet")
 
 _VIX_BINS   = [0, 15, 20, 30, 999]
 _VIX_LABELS = ["calm (<15)", "normal (15-20)", "elevated (20-30)", "fear (>30)"]
@@ -46,10 +47,14 @@ def _mtime(p):
 
 def _mark_correct(df):
     df = df.copy()
-    df["correct"] = (
-        ((df["signal"] ==  1) & (df["target"] == 1)) |
-        ((df["signal"] == -1) & (df["target"] == 0))
-    ).astype(int)
+    import numpy as np
+    labeled = df["target"].notna()
+    df["correct"] = np.where(
+        labeled,
+        (((df["signal"] ==  1) & (df["target"] == 1)) |
+         ((df["signal"] == -1) & (df["target"] == 0))).astype(float),
+        np.nan
+    )
     return df
 
 
@@ -90,7 +95,7 @@ class _Tip:
 
 
 # column header tooltip text for the signals treeview
-# columns: #1 ticker  #2 side  #3 sector  #4 conf  #5 price  #6 rsi  #7 zscore  #8 sect_z  #9 bb
+# columns: #1 ticker  #2 side  #3 sector  #4 conf  #5 price  #6 rsi  #7 zscore  #8 sect_z  #9 52wh
 _COL_TIPS = {
     "#1": "ticker\nstock symbol as listed on the exchange",
     "#2": (
@@ -126,8 +131,8 @@ _COL_TIPS = {
         " 50  neutral"
     ),
     "#7": (
-        "z-score  —  20-day price z-score\n"
-        "standard deviations from the 20-day rolling mean.\n"
+        "z-score  —  60-day price z-score\n"
+        "standard deviations from the 60-day rolling mean.\n"
         "+2 = well above average  /  −2 = well below"
     ),
     "#8": (
@@ -137,10 +142,10 @@ _COL_TIPS = {
         "negative = lagging sector peers recently"
     ),
     "#9": (
-        "bb pos  —  bollinger band position\n"
-        "where price sits within the 20-day bollinger bands.\n"
-        " 0 = at lower band    1 = at upper band\n"
-        ">1 = above upper band (extended / overbought)"
+        "52w-h  —  distance from 52-week high\n"
+        "how far price is below its 52-week high, as a percentage.\n"
+        " 0%  = at the 52-week high\n"
+        "-30% = 30% below the 52-week high (beaten down)"
     ),
 }
 
@@ -324,20 +329,28 @@ class Ra(tk.Tk):
 
         # step 01
         card1 = self._card(steps, "01", "download data",
-                           "5 years of s&p 500 ohlcv + gics sector features\n"
-                           "~3 min  ·  only needed once")
+                           "11 years of s&p 500 ohlcv + 40 features  ·  yfinance\n"
+                           "re-run to rebuild features after code changes")
         card1.pack(fill="x", pady=(0, 8))
         row1 = tk.Frame(card1, bg=CARD)
-        row1.pack(fill="x", padx=16, pady=(0, 14))
+        row1.pack(fill="x", padx=16, pady=(0, 4))
         self._btn_download = self._btn(row1, "run", self._do_download)
         self._btn_download.pack(side="left")
         self._spin_download = tk.Label(row1, text="", bg=CARD, fg=MUTED, font=F_SM)
         self._spin_download.pack(side="left", padx=(10, 0))
 
+        dl_row = tk.Frame(card1, bg=CARD)
+        dl_row.pack(fill="x", padx=16, pady=(0, 14))
+        self._force_dl = tk.BooleanVar(value=False)
+        tk.Checkbutton(dl_row, text="force re-download",
+                       variable=self._force_dl, bg=CARD, fg=MUTED, font=("Segoe UI", 8),
+                       activebackground=CARD, activeforeground=FG,
+                       selectcolor=BG, relief="flat", bd=0).pack(side="left")
+
         # step 02
         card2 = self._card(steps, "02", "train model",
-                           "walk-forward lightgbm  ·  target: beat spy over 21 days\n"
-                           "~5 min  ·  retrain monthly")
+                           "walk-forward lightgbm  ·  top-5 signals/day  ·  5-day hold\n"
+                           "retrain monthly")
         card2.pack(fill="x", pady=(0, 8))
         row2 = tk.Frame(card2, bg=CARD)
         row2.pack(fill="x", padx=16, pady=(0, 8))
@@ -348,27 +361,55 @@ class Ra(tk.Tk):
 
         # optuna controls
         opt_row = tk.Frame(card2, bg=CARD)
-        opt_row.pack(fill="x", padx=16, pady=(0, 14))
-        tk.Label(opt_row, text="optuna trials", bg=CARD, fg=MUTED, font=F_SM).pack(side="left")
-        self._n_trials = tk.IntVar(value=0)
-        self._trials_lbl = tk.Label(opt_row, text="off", bg=CARD, fg=MUTED,
+        opt_row.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Label(opt_row, text="optuna trials", bg=CARD, fg=MUTED, font=F_SM,
+                 width=13, anchor="w").pack(side="left")
+        self._n_trials = tk.IntVar(value=100)
+        self._trials_lbl = tk.Label(opt_row, text="100", bg=CARD, fg=GOLD,
                                     font=("Segoe UI", 9, "bold"), width=5)
         self._trials_lbl.pack(side="left", padx=(8, 0))
+
+        def _update_est():
+            trials  = self._n_trials.get()
+            threads = self._n_jobs.get()
+            total   = ((trials / 100) * 2.5 + 0.5) * (16 / max(threads, 1))
+            txt     = f"~{round(total * 60)}s" if total < 1 else f"~{round(total)}min"
+            self._est_lbl.configure(text=txt)
 
         def _on_trials(v):
             n = int(float(v))
             self._n_trials.set(n)
-            if n == 0:
-                self._trials_lbl.configure(text="off", fg=MUTED)
-            else:
-                self._trials_lbl.configure(text=str(n), fg=GOLD)
+            self._trials_lbl.configure(text="off" if n == 0 else str(n),
+                                       fg=MUTED if n == 0 else GOLD)
+            _update_est()
 
         ttk.Scale(opt_row, from_=0, to=150, variable=self._n_trials,
                   orient="horizontal", length=180,
                   command=_on_trials).pack(side="left", padx=8)
-        tk.Label(opt_row,
-                 text="0 = fixed params  ·  50–100 = recommended  ·  adds ~10 min",
+        tk.Label(opt_row, text="0 = fixed params  ·  50–100 = recommended",
                  bg=CARD, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+
+        # threads slider
+        thr_row = tk.Frame(card2, bg=CARD)
+        thr_row.pack(fill="x", padx=16, pady=(0, 14))
+        tk.Label(thr_row, text="threads", bg=CARD, fg=MUTED, font=F_SM,
+                 width=13, anchor="w").pack(side="left")
+        self._n_jobs = tk.IntVar(value=16)
+        self._jobs_lbl = tk.Label(thr_row, text="16", bg=CARD, fg=FG,
+                                  font=("Segoe UI", 9, "bold"), width=5)
+        self._jobs_lbl.pack(side="left", padx=(8, 0))
+
+        def _on_jobs(v):
+            n = max(1, int(float(v)))
+            self._n_jobs.set(n)
+            self._jobs_lbl.configure(text=str(n))
+            _update_est()
+
+        ttk.Scale(thr_row, from_=1, to=16, variable=self._n_jobs,
+                  orient="horizontal", length=180,
+                  command=_on_jobs).pack(side="left", padx=8)
+        self._est_lbl = tk.Label(thr_row, text="~3min", bg=CARD, fg=MUTED, font=F_SM)
+        self._est_lbl.pack(side="left", padx=(4, 0))
 
         self._spin_job = None   # pending after() id for spinner animation
 
@@ -436,7 +477,7 @@ class Ra(tk.Tk):
             ("sector", "sector",  58), ("conf",   "conf",    62),
             ("price",  "price",   84), ("rsi",    "rsi-14",  62),
             ("zscore", "z-score", 70), ("sect_z", "sect-z",  64),
-            ("bb",     "bb pos",  64),
+            ("bb",     "52w-h",   64),
         ]
         self._sort_state = {}   # col → True means currently sorted descending
         for col, lbl, w in self._col_defs:
@@ -588,14 +629,23 @@ class Ra(tk.Tk):
     # ── actions ───────────────────────────────────────────────────────────────
 
     def _do_download(self):
-        self._run(self._download_task, self._btn_download, self._spin_download)
+        self._run(self._download_task, self._btn_download, self._spin_download,
+                  self._force_dl.get())
 
-    def _download_task(self):
-        logging.info("downloading data...")
-        from data_pipeline import run_pipeline
+    def _download_task(self, force: bool = False):
+        import pandas as pd
         from feature_engineering import build_features_all
 
-        master   = run_pipeline(use_cache=False)
+        if not force and MASTER.exists():
+            logging.info("master data found — rebuilding features only (~2 min)...")
+            master = pd.read_parquet(MASTER)
+            master["date"] = pd.to_datetime(master["date"])
+        else:
+            logging.info("downloading 11yr s&p 500 data (~6 min)...")
+            from data_pipeline import run_pipeline
+            master = run_pipeline(use_cache=False)
+
+        logging.info("building features...")
         featured = build_features_all(master)
         featured.to_parquet(DATA, index=False)
 
@@ -614,18 +664,19 @@ class Ra(tk.Tk):
             messagebox.showwarning("ra", "download data first  (step 01)")
             return
         self._run(self._train_task, self._btn_train, self._spin_train,
-                  self._n_trials.get())
+                  self._n_trials.get(), self._n_jobs.get())
 
-    def _train_task(self, n_trials: int = 0):
+    def _train_task(self, n_trials: int = 0, n_jobs: int = -1):
         logging.info("training model...")
         if n_trials > 0:
             logging.info(f"optuna HPO enabled — {n_trials} trials")
+        logging.info(f"threads: {n_jobs if n_jobs != -1 else 'all'}")
         from model_training import run_walk_forward
         df = pd.read_parquet(DATA)
         df["date"] = pd.to_datetime(df["date"])
         if df["date"].dt.tz is not None:
             df["date"] = df["date"].dt.tz_convert(None)
-        preds = run_walk_forward(df, n_trials=n_trials)
+        preds = run_walk_forward(df, n_trials=n_trials, n_jobs=n_jobs)
         if preds is None or preds.empty:
             logging.error("training failed — no predictions generated")
             return
@@ -688,9 +739,9 @@ class Ra(tk.Tk):
                 f"{conf:.1%}",
                 f"${getattr(r, 'current_price', 0):.2f}",
                 f"{getattr(r, 'rsi_14', 0):.1f}",
-                f"{getattr(r, 'zscore_20', 0):.2f}",
+                f"{getattr(r, 'zscore_60', 0):.2f}",
                 f"{getattr(r, 'sector_rel_zscore', 0):.2f}",
-                f"{getattr(r, 'bb_pos_20', 0):.3f}",
+                f"{getattr(r, 'dist_52w_high', 0):.1%}",
             ), tags=(tag,))
 
         self._tree.tag_configure("long",     foreground=FG)
@@ -1133,44 +1184,48 @@ class Ra(tk.Tk):
 
   what it does
 
-  ra identifies s&p 500 stocks likely to outperform the market
-  index over the next 21 trading days using machine learning.
+  ra scans the s&p 500 daily, scores every stock using a
+  lightgbm model, and selects the top-5 long and top-5
+  short candidates. positions are held for 5 trading days.
 
-  the model (lightgbm) is trained on 5 years of price/volume
-  data and learns to rank stocks cross-sectionally — predicting
-  which will land in the top 30% of relative performers vs spy.
+  the model is trained on 11 years of price/volume data
+  (2015 – present) and learns to rank stocks by their
+  probability of landing in the top 30% of 21-day
+  relative performers vs spy.
 
   ──────────────────────────────────────────────────────
   pipeline
   ──────────────────────────────────────────────────────
 
     01  data download
-        5 years of s&p 500 ohlcv history via yfinance.
+        11 years of s&p 500 ohlcv history via yfinance.
         gics sector etf assignments scraped from wikipedia
         (cached locally — only re-fetches after 7 days).
-        features: rsi, bollinger bands, z-scores, moving
-        averages, volume ratios, atr, gap, vix regime.
+        38 features: rsi, z-scores, moving averages,
+        atr, volume regime, 52-week range, cross-sectional
+        ranks, sector identity (one-hot), vix, dispersion.
 
     02  model training
-        walk-forward cross-validation (8 folds × 3 months).
-        target: top 30% vs bottom 30% of 21-day excess return
-        vs spy, computed cross-sectionally per trading day.
-        the noisy middle 40% is dropped during training.
-        key insight: cross-sectional rank features (xs_rank,
-        sec_rank) are the primary alpha source. "most oversold
-        stock in xlk today" carries far more signal than
-        an absolute rsi reading of 30.
+        walk-forward cross-validation (~10 folds × 3 months).
+        hpo zone: first 1.5 years used exclusively for
+        optuna hyperparameter search — walk-forward test
+        sets never overlap this period.
+        target: top 30% vs bottom 30% of 21-day excess
+        return vs spy. middle 40% dropped during training.
+        spread gate: days where the model cannot
+        discriminate between stocks are skipped entirely.
 
     03  signals
-        fetches fresh data for all ~503 s&p 500 tickers.
-        computes all features on the latest completed bar.
-        ranks cross-sectionally across today's universe.
-        outputs tickers where model confidence ≥ min threshold.
+        fetches fresh data for all ~500 s&p 500 tickers.
+        computes 38 features on the latest completed bar.
+        selects top-5 longs and top-5 shorts by model
+        confidence. no signals if spread < threshold.
 
     04  backtest
         out-of-sample simulation on walk-forward test folds.
-        21-day holding period, 16 bps round-trip cost.
-        confidence-weighted position sizing.
+        5-day holding period, 16 bps round-trip cost.
+        overlapping-cohort equity curve (proper portfolio
+        simulation with simultaneous open positions).
         sharpe, calmar, max drawdown, win rate reported.
 
   ──────────────────────────────────────────────────────
@@ -1184,26 +1239,25 @@ class Ra(tk.Tk):
              xlre real estate               xlc  comm. services
 
     conf     model confidence — probability of top 30% 21d
-             relative performance vs spy. ≥65% = gold (high conviction)
+             relative performance vs spy
 
     rsi-14   relative strength index (14-day)
              >70 overbought / momentum  |  <30 oversold / reversal
 
-    z-score  20-day price z-score — standard deviations from mean
+    z-score  60-day price z-score — standard deviations from mean
 
     sect-z   sector-relative z-score — stock vs its sector etf
              positive = outperforming peers  |  negative = lagging
-
-    bb pos   bollinger band position: 0 = lower band, 1 = upper band
 
   ──────────────────────────────────────────────────────
   vix & strategy edge
   ──────────────────────────────────────────────────────
 
-    < 15    calm (amber)     trending market, mean reversion weaker
+    < 15    calm (amber)     trending market, reversion weaker
     15–20   normal (white)   moderate, balanced conditions
-    20–30   elevated (green) best conditions — reversion strengthens
-    > 30    fear (red)       high risk, correlations spike, edge degrades
+    20–30   elevated (green) reversion strengthens
+    > 30    fear (red)       strongest edge — panic creates
+                             the most mispriced setups
 
   ──────────────────────────────────────────────────────
   credits
@@ -1212,7 +1266,7 @@ class Ra(tk.Tk):
     development            @rawohl
 
     data sources           yfinance  ·  fred (vix)  ·  wikipedia
-    ml stack               lightgbm  ·  scikit-learn  ·  pandas
+    ml stack               lightgbm  ·  optuna  ·  shap  ·  pandas
     ui                     tkinter  ·  python 3.11+
 
   ──────────────────────────────────────────────────────

@@ -22,8 +22,8 @@ log = logging.getLogger(__name__)
 DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
 CLEAN_DIR = DATA_DIR / "clean"
-YEARS_BACK = 5
-MIN_TRADING_DAYS = 400
+YEARS_BACK = 11
+MIN_TRADING_DAYS = 1000
 
 # GICS Sector → sector ETF proxy
 SECTOR_ETF_MAP = {

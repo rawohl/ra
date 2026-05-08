@@ -232,10 +232,7 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
             "Check your internet connection and re-run step 01."
         )
 
-    result["vix_low"]    = (result["vix"] < 15).astype(float)
-    result["vix_normal"] = ((result["vix"] >= 15) & (result["vix"] < 20)).astype(float)
-    result["vix_high"]   = ((result["vix"] >= 20) & (result["vix"] < 30)).astype(float)
-    result["vix_fear"]   = (result["vix"] >= 30).astype(float)
+    # Raw VIX dominates the regime flag bins in SHAP — keep only the continuous value.
 
     # Sector-relative z-score
     log.info("Computing sector-relative features...")
@@ -288,6 +285,41 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
         for etf in ALL_SECTOR_ETFS:
             result[f"sector_{etf}"] = 0.0
 
+    # Sector vs market: how is each sector ETF performing relative to SPY?
+    # This gives the model the middle layer of the relative-value hierarchy:
+    # market → sector vs market → stock vs sector (sector_rel_zscore)
+    # Without this, the model can't distinguish "XLK stock beaten down in a healthy
+    # sector" from "XLK stock beaten down because the whole sector is under macro pressure."
+    log.info("Computing sector vs SPY relative return features...")
+    if "spy_ret" in ctx.columns and "sector_etf" in result.columns:
+        spy_ret_s = ctx["spy_ret"].copy()
+        spy_ret_s.index = spy_ret_s.index.astype("datetime64[ns]")
+        svs_frames = []
+        for etf in ALL_SECTOR_ETFS:
+            if etf not in sector_rets.columns:
+                continue
+            sec = sector_rets[etf].copy()
+            sec.index = sec.index.astype("datetime64[ns]")
+            spy_aligned = spy_ret_s.reindex(sec.index)
+            s20 = sec.rolling(20).sum() - spy_aligned.rolling(20).sum()
+            s60 = sec.rolling(60).sum() - spy_aligned.rolling(60).sum()
+            frame = pd.DataFrame({"sector_vs_spy_20d": s20, "sector_vs_spy_60d": s60})
+            frame.index.name = "date"
+            frame = frame.reset_index()
+            frame["sector_etf"] = etf
+            svs_frames.append(frame)
+        if svs_frames:
+            svs_df = pd.concat(svs_frames, ignore_index=True)
+            svs_df["date"] = svs_df["date"].astype("datetime64[ns]")
+            result = result.merge(svs_df, on=["date", "sector_etf"], how="left")
+        else:
+            result["sector_vs_spy_20d"] = 0.0
+            result["sector_vs_spy_60d"] = 0.0
+    else:
+        result["sector_vs_spy_20d"] = 0.0
+        result["sector_vs_spy_60d"] = 0.0
+    log.info("Sector vs SPY features done.")
+
     log.info("Computing cross-sectional rank features...")
     xs_cols = ["rsi_14", "zscore_20", "zscore_60", "dist_ma20", "ret_5d", "sector_rel_zscore",
                "dist_52w_high", "vol_ratio_20"]
@@ -320,25 +352,21 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
 
     # Drop rows missing core features or target; fill optional enrichment with neutral values
     sector_onehot_cols = {f"sector_{etf}" for etf in ALL_SECTOR_ETFS}
-    soft_cols = {"vix", "vix_low", "vix_normal", "vix_high", "vix_fear",
-                 "sector_rel_zscore", "xs_disp_5d", "xs_disp_20d"} | sector_onehot_cols
+    soft_cols = {"vix", "sector_rel_zscore", "xs_disp_5d", "xs_disp_20d",
+                 "sector_vs_spy_20d", "sector_vs_spy_60d"} | sector_onehot_cols
     core_cols = [c for c in get_feature_columns()
                  if c not in soft_cols and "_xs_rank" not in c and "_sec_rank" not in c]
     n_before = len(result)
     result = result.dropna(subset=core_cols)
     result = result.dropna(subset=["fwd_ret_21d"])
     result["vix"]               = result["vix"].fillna(20.0)
-    result["vix_low"]           = result["vix_low"].fillna(0.0)
-    result["vix_normal"]        = result["vix_normal"].fillna(1.0)
-    result["vix_high"]          = result["vix_high"].fillna(0.0)
-    result["vix_fear"]          = result["vix_fear"].fillna(0.0)
     result["sector_rel_zscore"] = result["sector_rel_zscore"].fillna(0.0)
-    # xs/sec rank NaN → 0.5 (neutral)
     xs_rank_cols = [c for c in result.columns if "_xs_rank" in c or "_sec_rank" in c]
     result[xs_rank_cols] = result[xs_rank_cols].fillna(0.5)
-    # dispersion NaN → population mean (first few rows of history)
-    result["xs_disp_5d"]  = result["xs_disp_5d"].fillna(result["xs_disp_5d"].mean())
-    result["xs_disp_20d"] = result["xs_disp_20d"].fillna(result["xs_disp_20d"].mean())
+    result["xs_disp_5d"]        = result["xs_disp_5d"].fillna(result["xs_disp_5d"].mean())
+    result["xs_disp_20d"]       = result["xs_disp_20d"].fillna(result["xs_disp_20d"].mean())
+    result["sector_vs_spy_20d"] = result["sector_vs_spy_20d"].fillna(0.0)
+    result["sector_vs_spy_60d"] = result["sector_vs_spy_60d"].fillna(0.0)
     log.info(f"Dropped {n_before - len(result):,} NaN rows. {len(result):,} remaining.")
 
     return result
@@ -346,29 +374,33 @@ def build_features_all(master: pd.DataFrame) -> pd.DataFrame:
 
 def get_feature_columns() -> list:
     return [
-        "rsi_7", "rsi_14", "rsi_21",
-        "bb_pos_10", "bb_pos_20",
-        "zscore_10", "zscore_20", "zscore_60",
+        # price-based technicals
+        "rsi_14", "rsi_21",
+        "zscore_60",
         "dist_ma20", "dist_ma50", "dist_ma200",
-        "vol_ratio_10", "vol_ratio_20", "down_volume",
-        "atr_norm", "vol_regime",
-        "gap", "consec_down", "consec_up",
         "dist_52w_high", "dist_52w_low",
-        "intraday_range",
-        "ret_1d", "ret_2d", "ret_5d", "ret_10d", "ret_20d",
-        "vix", "vix_low", "vix_normal", "vix_high", "vix_fear",
+        "atr_norm", "vol_regime", "intraday_range",
+        # volume
+        "vol_ratio_20",
+        # returns (5d+ only — shorter windows are too noisy)
+        "ret_5d", "ret_10d", "ret_20d",
+        # market context
+        "vix",
+        # sector-relative signal
         "sector_rel_zscore",
-        # cross-sectional ranks (xs = vs all S&P 500, sec = within sector)
+        # cross-sectional ranks: absolute values matter less than rank within universe
         "rsi_14_xs_rank", "zscore_20_xs_rank", "zscore_60_xs_rank",
         "dist_ma20_xs_rank", "ret_5d_xs_rank", "sector_rel_zscore_xs_rank",
         "dist_52w_high_xs_rank", "vol_ratio_20_xs_rank",
+        # sector-relative ranks
         "rsi_14_sec_rank", "zscore_20_sec_rank",
         "ret_5d_sec_rank", "sector_rel_zscore_sec_rank",
-        # regime gate: cross-sectional return dispersion
+        # regime gate
         "xs_disp_5d", "xs_disp_20d",
-        # sector identity — lets model learn per-sector biases vs SPY
-        "sector_XLK", "sector_XLF", "sector_XLV", "sector_XLE", "sector_XLI",
-        "sector_XLY", "sector_XLP", "sector_XLU", "sector_XLB", "sector_XLRE", "sector_XLC",
+        # sector identity (one-hot) — model learns sector-specific biases vs SPY
+        # XLU/XLE/XLY/XLC dropped (bottom 25% SHAP importance)
+        "sector_XLK", "sector_XLF", "sector_XLV",
+        "sector_XLI", "sector_XLP", "sector_XLB", "sector_XLRE",
     ]
 
 

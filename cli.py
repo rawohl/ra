@@ -264,11 +264,15 @@ _VIX_LABELS = ["calm (<15)", "normal (15-20)", "elevated (20-30)", "fear (>30)"]
 
 
 def _mark_correct(df: pd.DataFrame) -> pd.DataFrame:
+    import numpy as np
     df = df.copy()
-    df["correct"] = (
-        ((df["signal"] ==  1) & (df["target"] == 1)) |
-        ((df["signal"] == -1) & (df["target"] == 0))
-    ).astype(int)
+    labeled = df["target"].notna()
+    df["correct"] = np.where(
+        labeled,
+        (((df["signal"] ==  1) & (df["target"] == 1)) |
+         ((df["signal"] == -1) & (df["target"] == 0))).astype(float),
+        np.nan
+    )
     return df
 
 
@@ -374,8 +378,8 @@ def cmd_regime(debug: bool = False):
     def _regime_row(bucket):
         longs  = bucket[bucket["signal"] ==  1]
         shorts = bucket[bucket["signal"] == -1]
-        lp = float(longs["correct"].mean())  if len(longs)  > 10 else float("nan")
-        sp = float(shorts["correct"].mean()) if len(shorts) > 10 else float("nan")
+        lp = float(longs["correct"].mean())  if longs["correct"].notna().sum()  > 10 else float("nan")
+        sp = float(shorts["correct"].mean()) if shorts["correct"].notna().sum() > 10 else float("nan")
         avail = total_per_date.reindex(bucket["date"].unique()).sum()
         rate  = len(bucket) / avail if avail > 0 else float("nan")
         return lp, sp, rate

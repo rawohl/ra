@@ -10,7 +10,7 @@ import pickle
 
 from feature_engineering import build_features, get_feature_columns, zscore, ALL_SECTOR_ETFS
 from data_pipeline import get_sp500_universe
-from config import TOP_N
+from config import TOP_N, MIN_SPREAD
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -140,7 +140,15 @@ def fetch_sector_etf_returns(etfs: list[str], start: str, end: str) -> pd.DataFr
 
     if SECTOR_CACHE.exists():
         cached = pd.read_parquet(SECTOR_CACHE)
-        cached = cached.rename(columns={"Date": "date"})
+        # Normalise: handle date as column ("date"/"Date"/"index") or as named/unnamed index
+        if "date" not in cached.columns:
+            if "Date" in cached.columns:
+                cached = cached.rename(columns={"Date": "date"})
+            elif "index" in cached.columns:
+                cached = cached.rename(columns={"index": "date"})
+            else:
+                cached = cached.reset_index()
+                cached = cached.rename(columns={"Date": "date", "index": "date"})
         cached["date"] = pd.to_datetime(cached["date"])
         cached = cached.set_index("date").sort_index()
         last_dt = cached.index.max()
@@ -150,6 +158,7 @@ def fetch_sector_etf_returns(etfs: list[str], start: str, end: str) -> pd.DataFr
         if not new.empty:
             cached = cached[cached.index < new.index.min()]
             cached = pd.concat([cached, new]).sort_index()
+        cached.index.name = "date"  # pd.concat loses name when the two sides differ
         result = cached[cached.index >= start_dt]
         cached.reset_index().to_parquet(SECTOR_CACHE, index=False)
         return result
@@ -175,7 +184,9 @@ def _fetch_etf_raw(etfs: list[str], start: str, end: str) -> pd.DataFrame:
                 out[etf] = prices.pct_change()
             except Exception:
                 continue
-        return pd.DataFrame(out)
+        result = pd.DataFrame(out)
+        result.index.name = "date"
+        return result
     except Exception as e:
         log.warning(f"Sector ETF fetch failed: {e}")
         return pd.DataFrame()
@@ -224,13 +235,9 @@ def generate_signals(top_n: int = TOP_N) -> pd.DataFrame:
 
     # Fetch shared context once for all tickers
     current_vix = fetch_current_vix()
-    vix_low     = float(current_vix < 15)
-    vix_normal  = float(15 <= current_vix < 20)
-    vix_high    = float(20 <= current_vix < 30)
-    vix_fear    = float(current_vix >= 30)
 
     all_etfs    = list(set(universe.values()))
-    sector_rets = fetch_sector_etf_returns(all_etfs, start_str, end_str)
+    sector_rets = fetch_sector_etf_returns(all_etfs + ["SPY"], start_str, end_str)
 
     # Cross-sectional return dispersion: std of daily returns across all tickers.
     # Low dispersion = correlated market (macro shock) = signals less reliable.
@@ -246,11 +253,28 @@ def generate_signals(top_n: int = TOP_N) -> pd.DataFrame:
     else:
         log.info(f"regime dispersion  5d={xs_disp_5d:.4f}  20d={xs_disp_20d:.4f}")
 
+    # Pre-compute sector vs SPY relative return for latest date (one value per sector ETF).
+    # Used to give the model the middle layer: market → sector vs market → stock vs sector.
+    sector_vs_spy_vals: dict = {}
+    if "SPY" in sector_rets.columns and len(sector_rets["SPY"].dropna()) >= 60:
+        spy_20 = sector_rets["SPY"].rolling(20).sum()
+        spy_60 = sector_rets["SPY"].rolling(60).sum()
+        for etf in all_etfs:
+            if etf in sector_rets.columns:
+                v20 = float(sector_rets[etf].rolling(20).sum().iloc[-1]) - float(spy_20.iloc[-1])
+                v60 = float(sector_rets[etf].rolling(60).sum().iloc[-1]) - float(spy_60.iloc[-1])
+                sector_vs_spy_vals[etf] = (
+                    v20 if np.isfinite(v20) else 0.0,
+                    v60 if np.isfinite(v60) else 0.0,
+                )
+    log.info(f"sector vs SPY computed for {len(sector_vs_spy_vals)} ETFs")
+
     # these are computed globally (not per-ticker) and injected after the loop
     rank_cols   = {c for c in feature_cols if "_xs_rank" in c or "_sec_rank" in c}
-    global_ctx  = {"vix", "vix_low", "vix_normal", "vix_high", "vix_fear",
-                   "sector_rel_zscore", "xs_disp_5d", "xs_disp_20d"}
-    base_cols   = [c for c in feature_cols if c not in rank_cols and c not in global_ctx]
+    sector_cols = {c for c in feature_cols if c.startswith("sector_")}
+    global_ctx  = {"vix", "sector_rel_zscore", "xs_disp_5d", "xs_disp_20d"}
+    base_cols   = [c for c in feature_cols
+                   if c not in rank_cols and c not in global_ctx and c not in sector_cols]
 
     rows = []
     for ticker, df in data.items():
@@ -266,10 +290,6 @@ def generate_signals(top_n: int = TOP_N) -> pd.DataFrame:
 
             # global context — same value for all tickers
             row["vix"]               = current_vix
-            row["vix_low"]           = vix_low
-            row["vix_normal"]        = vix_normal
-            row["vix_high"]          = vix_high
-            row["vix_fear"]          = vix_fear
 
             # Sector one-hot: same encoding used during training
             ticker_sector = universe.get(ticker, "SPY")
@@ -279,6 +299,9 @@ def generate_signals(top_n: int = TOP_N) -> pd.DataFrame:
                 df, universe.get(ticker, "SPY"), sector_rets)
             row["xs_disp_5d"]        = xs_disp_5d
             row["xs_disp_20d"]       = xs_disp_20d
+            svs = sector_vs_spy_vals.get(ticker_sector, (0.0, 0.0))
+            row["sector_vs_spy_20d"] = svs[0]
+            row["sector_vs_spy_60d"] = svs[1]
 
             row["ticker"]        = ticker
             row["current_price"] = float(latest["Close"])
@@ -333,6 +356,12 @@ def generate_signals(top_n: int = TOP_N) -> pd.DataFrame:
     X = features_df[feature_cols]
     features_df["prob_up"] = model.predict_proba(X)[:, 1]
 
+    spread = float(features_df["prob_up"].max() - features_df["prob_up"].min())
+    if spread < MIN_SPREAD:
+        log.info(f"Probability spread {spread:.4f} below MIN_SPREAD {MIN_SPREAD} "
+                 f"— model too uncertain today, no signals.")
+        return pd.DataFrame()
+
     # Top-N selection: rank all stocks by confidence, take best N each direction.
     longs  = features_df.nlargest(top_n,  "prob_up").copy()
     shorts = features_df.nsmallest(top_n, "prob_up").copy()
@@ -351,7 +380,7 @@ def generate_signals(top_n: int = TOP_N) -> pd.DataFrame:
 
     out_cols = [
         "ticker", "side", "prob_up", "current_price", "sector_etf",
-        "rsi_14", "zscore_20", "bb_pos_20", "dist_ma20",
+        "rsi_14", "zscore_60", "dist_52w_high", "dist_ma20",
         "sector_rel_zscore", "vix", "xs_disp_5d", "xs_disp_20d", "vol_regime", "date",
     ]
     available = [c for c in out_cols if c in signals.columns]
